@@ -1,0 +1,227 @@
+---
+title: "Temporal Trends with Interactions"
+author: "Eli Wildey"
+date: "2025-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(mgcv)
+library(stringr)
+library(tidyr)
+library(gratia)
+library(ggplot2)
+library(janitor)
+library(sf)
+
+
+dfBear <- read_rds(paste(getwd(), "effort_by_occ_df_counttriggers_sf2019-2024.rds", sep="/"))%>%
+  select(-c(matches("YOUNG")))
+colnames(dfBear)[7] <- "BEAR_AMT"
+dfFur <- read_rds(paste(getwd(), "effort_by_occ_df_counttriggers_sf_prec80.rds", sep="/"))%>%
+  select(-c(matches("PRESENT")))%>%st_transform(., 3071)
+
+#occasions are 7 days long
+days_active_threshold <- 4
+
+ppn_class_threshold <-  0.95
+
+
+#All Furbearers
+df.byoccFur <- dfFur %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(prop_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,zone) %>%
+  summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+            across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+            num.sites = n(),
+            num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days, 
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(season+2017,str_pad(occ, width=2, side="left", pad="0"))) %>%
+  arrange(yearocc) %>% 
+  group_by(yearocc) %>%
+  mutate(time = cur_group_id())
+
+#By zone
+df.byocc.longFur = df.byoccFur %>%
+  select(time, season,occ,zone,num.sites,
+         matches("_occ")) %>%
+  pivot_longer(cols=matches("_occ"))%>%
+  mutate(year=season+2018)
+
+df.byocc.longFur$zone <- as.factor(df.byocc.longFur$zone)
+df.byocc.longFur$binomresponse <- with(df.byocc.longFur, cbind(value, num.sites - value))
+
+#Bears
+df.byoccBear <- dfBear %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(ppn_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,bear_mgmt_zone_id) %>%
+  summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+            across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+            num.sites = n(),
+            num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days, 
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(season+2017,str_pad(occ, width=2, side="left", pad="0"))) %>%
+  arrange(yearocc) %>% 
+  group_by(yearocc) %>%
+  mutate(time = cur_group_id())
+
+df.byocc.longBear = df.byoccBear %>%
+  select(time, season, occ,bear_mgmt_zone_id, num.sites,
+         BEAR_occ) %>%
+  pivot_longer(cols=c(BEAR_occ))%>%
+  mutate(year=season+2018)%>%rename(zone = bear_mgmt_zone_id)
+
+df.byocc.longBear$binomresponse <- with(df.byocc.longBear, cbind(value, num.sites - value))
+df.byocc.longBear$zone <- as.factor(df.byocc.longBear$zone)
+
+zonesAD <- df.byocc.longBear%>%filter(zone %in% LETTERS[1:4])
+
+df.byoccAllSp <- rbind(df.byocc.longFur, zonesAD)
+
+specieslist <- str_extract(unique(df.byoccAllSp$name), pattern =  "^[A-Z]*")
+
+```
+
+```{r run models}
+#p is the autoregressive order, how many previous values are used to predict current value
+  gambinom_plot <- function (specieslist, dataframe){ 
+      #set up to loop through species dataframes
+      nspecies <- length(specieslist)
+      titles <- make_clean_names(sub("(FOX|SKUNK)(.*)", "\\2 \\1", x = specieslist), case = "title")
+     binomlist <- lapply(seq(1:nspecies), function(x){ 
+        speciesframe <- filter(dataframe, grepl(name, pattern = specieslist[x]))
+        
+      #this is needed for the ARMA models   
+      knots <- list(occ = c(0.5, 52.5))
+      
+      #model with year effect
+      m0y <- gam(binomresponse ~ zone + s(season, k=6, by=zone) + s(occ, bs = "cc", k=52),
+                    data = speciesframe,
+                    family = binomial)
+      #model with time effect instead of year  
+      m0t <- gam(binomresponse ~ zone + s(time, k=6, by=zone) + s(occ, bs = "cc", k=52),
+          data = speciesframe,
+          family = binomial)  
+      #model with year x occ interaction as well as occ x zone interaction
+      m2y <- gam(binomresponse ~ zone + s(season, k=6, by=zone) + s(occ, bs = "cc", k=52, by=zone) +
+            ti(season, occ, bs = c("tp", "cc")),
+          data = speciesframe,
+          family = binomial,
+          knots=knots)
+      #model with time x occ interaction as well as occ x zone interaction
+      m2t <- gam(binomresponse ~ zone + s(time, k=6, by=zone) + s(occ, bs = "cc", k=52, by=zone) +
+            ti(time, occ, bs = c("tp", "cc")),
+          data = speciesframe,
+          family = binomial,
+          knots=knots)
+
+
+ AIC(m0y, m0t, m2y, m2t)
+modelist <- list(m0y=m0y, m0t=m0t, m2y=m2y, m2t=m2t)
+
+
+newdatay <- expand.grid(season=unique(speciesframe$season), zone=unique(speciesframe$zone), occ=26)
+
+
+yrtrendm0t <- fitted_values(m0t, exclude="s(occ)")
+yrtrendm0y <- fitted_values(m0y, data=newdatay, exclude="s(occ)")%>%mutate(time=rep(seq(26, length.out=6, by=52),length(unique(speciesframe$zone))))
+yrtrendm2t <- fitted_values(m2t, exclude=c("s(occ):zoneNORTHERN ZONE", "s(occ):zoneSOUTHERN ZONE", "ti(time,occ)"))
+yrtrendm2y <- fitted_values(m2y, data=newdatay, exclude=c("s(occ):zoneNORTHERN ZONE", "s(occ):zoneSOUTHERN ZONE", "ti(season,occ)"))%>%mutate(time=rep(seq(26, length.out=6, by=52),length(unique(speciesframe$zone))))
+
+occtrendm0t <- fitted_values(m0t)
+occtrendm0y <- fitted_values(m0y)
+occtrendm2t <- fitted_values(m2t)
+occtrendm2y <- fitted_values(m2y)
+occtrend$time <- rep(1:312, each=length(unique(x$zone)))
+
+
+
+m0plot <- ggplot() +
+  geom_line(data=occtrend, aes(x = time, y = .fitted, color=zone), lwd=0.5) +
+  geom_line(data=yrtrend, aes(x = time, y = .fitted, color=zone), lwd=2) +
+  geom_pointrange(data=yrtrend, aes(x= time, y= .fitted,ymin = .lower_ci, ymax = .upper_ci, color=zone), size=1, lwd=1) +
+  labs(title=str_wrap(sprintf("Prediction Plot Binomial- %s  weekly detections, AR(0)", titles[x]),75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2024") +
+  geom_vline(xintercept=seq(1,53*6,52)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(26,52*6,52)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Furbearer Zone",
+                     labels = c("Northern Zone","Southern Zone")) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Furbearer Zone",
+                    labels = c("Northern Zone","Southern Zone"))
+
+#plot the most complciated model with a significant difference in p-value from prior model
+if(any(!is.na(anovatab$`p-value`) & anovatab$`p-value` <= 0.05)){
+topARMA <- anovatab%>%filter(`p-value` <= 0.05)%>%slice(n())%>%rownames()
+yrtrend <- fitted_values(eval(parse(text = topARMA)), data=newdata2, exclude="s(occ)")
+yrtrend$time <-  rep(seq(26, length.out=6, by=52),2)
+occtrend <- fitted_values(eval(parse(text = topARMA)))
+occtrend$time <- rep(1:312, each=2)
+
+topARMAplot <- ggplot() +
+  geom_line(data=occtrend, aes(x = time, y = .fitted, color=zone), lwd=0.5) +
+  geom_line(data=yrtrend, aes(x = time, y = .fitted, color=zone), lwd=2) +
+  geom_pointrange(data=yrtrend, aes(x= time, y= .fitted,ymin = .lower_ci, ymax = .upper_ci, color=zone), size=1, lwd=1) +
+  labs(title=str_wrap(sprintf("Prediction Plot Binomial- %s  weekly detections %s model", titles[x], topARMA),75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2024") +
+  geom_vline(xintercept=seq(1,53*6,52)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(26,52*6,52)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Furbearer Zone",
+                     labels = c("Northern Zone","Southern Zone")) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Furbearer Zone",
+                    labels = c("Northern Zone","Southern Zone"))
+}else{
+  #if no models with signifcant p-value plot AR(1) model
+yrtrend <- fitted_values(m1, data=newdata2, exclude="s(occ)")
+yrtrend$time <-  rep(seq(26, length.out=6, by=52),2)
+occtrend <- fitted_values(m1)
+occtrend$time <- rep(1:312, each=2)
+
+topARMAplot <- ggplot() +
+  geom_line(data=occtrend, aes(x = time, y = .fitted, color=zone), lwd=0.5) +
+  geom_line(data=yrtrend, aes(x = time, y = .fitted, color=zone), lwd=2) +
+  geom_pointrange(data=yrtrend, aes(x= time, y= .fitted,ymin = .lower_ci, ymax = .upper_ci, color=zone), size=1, lwd=1) +
+  labs(title=str_wrap(sprintf("Prediction Plot Binomial- %s  weekly detections AR(1) model", titles[x]),75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2024") +
+  geom_vline(xintercept=seq(1,53*6,52)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(26,52*6,52)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Furbearer Zone",
+                     labels = c("Northern Zone","Southern Zone")) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Furbearer Zone",
+                    labels = c("Northern Zone","Southern Zone"))
+}
+        #make list of plots if ARMA models ran
+       plots <- list(m0plot=m0plot, topplot=topARMAplot)
+}else{
+        #return plot of model without ARMA if ARMA models didn't run
+         plots <- list(m0plot=m0plot) 
+        }
+          })
+      names(binomlist) <- specieslist
+      return(binomlist)
+  }
+  
+  binom_plots <- gambinom_plot(dataframe = df.byocc.both2, specieslist = specieslist)
+```
+
