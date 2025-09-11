@@ -1,0 +1,632 @@
+---
+title: "OldvsNewTemporalTrends"
+output: html_document
+date: "2025-08-11"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(mgcv)
+library(stringr)
+library(tidyr)
+library(gratia)
+library(ggplot2)
+library(janitor)
+library(sf)
+library(patchwork)
+
+# add sample sizes, y starts at 0, change titles, increase size of axis titles
+dfBear <- read_rds(paste(getwd(), "effort_by_occ_df_counttriggers_sf2019-2024.rds", sep="/"))%>%
+  select(-c(matches("YOUNG")))
+colnames(dfBear)[7] <- "BEAR_AMT"
+dfFur <- read_rds(paste(getwd(), "effort_by_occ_df_counttriggers_sf_prec80.rds", sep="/"))%>%
+  select(-c(matches("PRESENT")))%>%st_transform(., 3071)
+
+#occasions are 7 days long
+days_active_threshold <- 4
+
+ppn_class_threshold <-  0.95
+
+
+#All Furbearers
+df.byoccFur <- dfFur %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(prop_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,zone) %>%
+  summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+            across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+            num.sites = n(),
+            num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days, 
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(season+2017,str_pad(occ, width=2, side="left", pad="0"))) %>%
+  arrange(yearocc) %>% 
+  group_by(yearocc) %>%
+  mutate(time = cur_group_id())
+
+#By zone
+df.byocc.longFur = df.byoccFur %>%
+  select(time, season,occ,zone,num.sites,
+         matches("_occ|_propocc")) %>%
+  pivot_longer(cols=matches("_occ|_propocc"))%>%
+  mutate(year=season+2018)
+
+df.byocc.longFur$zone <- as.factor(df.byocc.longFur$zone)
+df.byocc.longFur$binomresponse <- with(df.byocc.longFur, cbind(value, num.sites - value))
+
+#table for number of sites
+table.temporal.camsites.byoccFur <-df.byocc.longFur%>%select(year,occ,zone, num.sites)%>%st_drop_geometry()
+
+#Bears
+df.byoccBear <- dfBear %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(ppn_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,bear_mgmt_zone_id) %>%
+  summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+            across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+            num.sites = n(),
+            num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days, 
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(season+2017,str_pad(occ, width=2, side="left", pad="0"))) %>%
+  arrange(yearocc) %>% 
+  group_by(yearocc) %>%
+  mutate(time = cur_group_id())
+
+df.byocc.longBear = df.byoccBear %>%
+  select(time, season, occ,bear_mgmt_zone_id, num.sites,
+         BEAR_occ, BEAR_propocc) %>%
+  pivot_longer(cols=c(BEAR_occ, BEAR_propocc))%>%
+  mutate(year=season+2018)%>%rename(zone = bear_mgmt_zone_id)
+
+
+df.byocc.longBear$binomresponse <- with(df.byocc.longBear, cbind(value, num.sites - value))
+df.byocc.longBear$zone <- as.factor(df.byocc.longBear$zone)
+
+#get rid of zones E and F
+zonesAD <- df.byocc.longBear%>%filter(zone %in% LETTERS[1:4])
+
+#table for number of sites
+table.temporal.camsites.byoccBear <-df.byocc.longBear%>%select(year,occ,zone, num.sites)%>%st_drop_geometry()
+
+table.temporal.camsites.byoccFur %>%
+  kableExtra::kbl() %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
+
+df.byoccAllSp <- rbind(df.byocc.longFur, zonesAD)
+
+specieslist <- unique(str_extract(df.byoccAllSp$name, pattern =  "^[A-Z]*"))
+
+```
+
+```{r run models, include=FALSE}
+#p is the autoregressive order, how many previous values are used to predict current value
+  plot_temporal <- function (specieslist, dataframe){ 
+      #set up to loop through species dataframes
+      nspecies <- length(specieslist)
+      titles <- make_clean_names(sub("(FOX|SKUNK)(.*)", "\\2 \\1", x = specieslist), case = "title")
+     binomlist <- lapply(seq(1:nspecies), function(i){ 
+        speciesframe <- filter(dataframe, grepl(name, pattern = specieslist[i]))
+        propocc <- speciesframe%>%filter(grepl(pattern = "_propocc$", name))
+        binom <- speciesframe%>%filter(grepl(pattern = "_occ$", name))
+        
+        #old way
+    oldtemp <-ggplot(propocc,aes(x=time,y=value,col=zone)) +
+  geom_smooth(span=0.1, lwd=0.3,se=FALSE) + 
+  geom_smooth() +
+  geom_vline(xintercept=seq(1,53*6,52)) +
+  labs(#title=str_wrap(sprintf("Weekly Proportion of Snapshot camera \n sites with %s detections", titles[i]),75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2024") +
+  scale_x_continuous(breaks = seq(26,52*6,52),
+                     labels = seq(2019,2024,1)) +
+    coord_cartesian(ylim=c(0,NA), expand = FALSE) + #xlim=c(53, 365),
+  scale_color_brewer(palette = "Set2",
+                       name = "Mgmt Zone",
+                       labels = unique(propocc$zone)) +
+      theme(legend.position = "bottom")
+        
+      #GAM  
+      #this is needed for the ARMA models   
+      knots <- list(occ = c(0.5, 52.5))
+      
+      #model with year x occ interaction as well as occ x zone interaction
+      m2y <- gam(binomresponse ~ zone + s(season, k=6, by=zone) + s(occ, bs = "cc", k=52, by=zone) +
+            ti(season, occ, bs = c("tp", "cc"), k=c(5,5)),
+          data = binom,
+          family = binomial,
+          knots=knots)
+      
+
+
+
+
+newdatay <- expand.grid(season=unique(binom$season), zone=unique(binom$zone), occ=26)
+
+occeffects <- paste("s(occ)", paste0("zone",unique(binom$zone)), sep=":")
+#predict just year trend
+yrtrendm2y <- fitted_values(m2y, data=newdatay, exclude=c(occeffects,"ti(season,occ)"))%>%mutate(time=rep(seq(26, length.out=6, by=52),length(unique(binom$zone))))
+
+
+#predict whole model
+
+occtrendm2y <- fitted_values(m2y)%>%mutate(time=rep(1:312, each=length(unique(binom$zone))))
+
+
+
+plottemp <-  ggplot() +
+  geom_line(data=occtrendm2y, aes(x = time, y = .fitted, color=zone), lwd=0.5) +
+  geom_line(data=yrtrendm2y, aes(x = time, y = .fitted, color=zone), lwd=2) +
+  geom_pointrange(data=yrtrendm2y, aes(x= time, y= .fitted,ymin = .lower_ci, ymax = .upper_ci, color=zone), size=1, lwd=1) +
+  labs(#title=str_wrap(sprintf("Prediction Plot Binomial- %s weekly detections", titles[i]),75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2024") + 
+  geom_vline(xintercept=seq(1,53*6,52)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(26,52*6,52)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Mgmt Zone",
+                     labels = unique(binom$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Mgmt Zone",
+                    labels = unique(binom$zone)) +
+  theme(legend.position = "bottom")
+
+
+list(oldtemp, plottemp)
+})
+     
+      names(binomlist) <- specieslist
+      return(binomlist)
+  }
+  
+ speciesplots <- plot_temporal(dataframe = df.byoccAllSp, specieslist = specieslist)
+```
+
+
+### Bear
+```{r, fig.width=9, echo=FALSE, message=FALSE}
+speciesplots[["BEAR"]][[1]] + speciesplots[["BEAR"]][[2]] + plot_annotation('Weekly Proportion of Snapshot camera sites with Bear detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+```
+
+### Beaver
+```{r beaver, fig.width=11,  echo=FALSE, message=FALSE}
+
+speciesplots[["BEAVER"]][[1]] + speciesplots[["BEAVER"]][[2]] + plot_annotation('Weekly Proportion of Snapshot camera sites with Beaver detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+```
+
+### Bobcat
+```{r bobcat, fig.width=11,  echo=FALSE, message=FALSE}
+
+
+speciesplots[["BOBCAT"]][[1]] + speciesplots[["BOBCAT"]][[2]] + plot_annotation('Weekly Proportion of Snapshot camera sites with Bobcat detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+```
+
+### Coyote
+```{r coyote, fig.width=11,  echo=FALSE, message=FALSE}
+
+speciesplots[["COYOTE"]][[1]] + speciesplots[["COYOTE"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Coyote detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+```
+
+### FISHER
+```{r fisher, fig.width=11,  echo=FALSE, message=FALSE}
+
+speciesplots[["FISHER"]][[1]] + speciesplots[["FISHER"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Fisher detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+```
+
+### Grey Fox
+```{r grey fox, fig.width=11,  echo=FALSE, message=FALSE}
+
+speciesplots[["FOXGRAY"]][[1]] + speciesplots[["FOXGRAY"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Grey Fox detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+```
+
+### Red Fox
+```{r red fox, fig.width=11,  echo=FALSE, message=FALSE}
+
+speciesplots[["FOXRED"]][[1]] + speciesplots[["FOXRED"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Red Fox detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+```
+
+### Opossum
+```{r opposum, fig.width=11, echo=FALSE, message=FALSE}
+
+speciesplots[["OPOSSUM"]][[1]] + speciesplots[["OPOSSUM"]][[2]] + plot_annotation('Weekly Proportion of Snapshot camera sites with Opossum detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+
+```
+
+### Otter
+```{r otter, fig.width=11, echo=FALSE, message=FALSE}
+speciesplots[["OTTER"]][[1]] + speciesplots[["OTTER"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Otter detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+```
+
+### RACCOON
+```{r raccoon, fig.width=11, echo=FALSE, message=FALSE}
+
+speciesplots[["RACCOON"]][[1]] + speciesplots[["RACCOON"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Raccoon detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+```
+
+### Skunk
+```{r skunk, fig.width=11, echo=FALSE, message=FALSE}
+
+speciesplots[["SKUNKSTRIPED"]][[1]] + speciesplots[["SKUNKSTRIPED"]][[2]]+ plot_annotation('Weekly Proportion of Snapshot camera sites with Striped Skunk detections',theme=theme(plot.title=element_text(hjust=0.5)))
+
+
+```
+
+## Old Workflow
+```{r, eval=FALSE}
+#######################################################
+##       Connecting to Snapshot Wisconsin database   ##
+#######################################################
+
+# connect to data base
+sswids::connect_to_sswidb(db_version = 'PROD')
+
+`# create project folders
+#sswids::setup_project()
+
+#####################################################################################
+####                               Set data parameters                          #####
+#####################################################################################
+
+# set min/max years for obtaining data
+min_year <- 2019
+max_year <- 2023
+
+# season start/end dates (in -MM-DD format)
+# start with this and consider early spring and fall for getting newborns and yearlings 
+min_date <- '-01-01'
+max_date <- '-12-31'
+
+#early spring
+min_date <- '-04-01'
+max_date <- '-06-01'
+
+#fall
+min_date <- '-09-20'
+max_date <- '-11-30'
+
+# what years of data to query?
+years <- seq(min_year, max_year, 1)
+
+# create data frame of seasons for data filtering
+seasons_df <-
+  create_season_dates(
+    min_date = min_date,
+    max_date = max_date,
+    years = c(2019,2023)
+  )
+
+# check out these dates
+sswids::check_season_dates(seasons_df)
+
+
+# set species and grid types
+species <- c('Bear')
+grid <- c('SSWI')
+
+
+# set classification precision level
+prec <- 0.95
+
+# set distance (meters) between camera_location_seq_nos to merge/average locations
+cam_distance <- 100
+
+# set precision of lat/long coordinates (how many decimal places are needed?)
+coord_prec <- 4
+
+# set desired proportion of photos classified (per sampling occasion) threshold
+ppn_class_threshold <- 0
+
+
+##########################################################
+##                   Query raw data                     ##
+##########################################################
+
+
+# query databases
+raw_data <-
+  sswids::query_raw_data(
+    species = species,
+    grid = grid,
+    season = seasons_df, # season dates/years to query
+    prec = prec # ,
+    # by default all 3 data sets are queried, but can just query detections/effort only 
+    # outputs = c('detections', 'effort', 'locations')
+  )
+
+# save the raw queries
+write_raw_data(raw_data, filename="All")
+
+# continue using detections, effort, and locations separately
+# read in from raw_data folder
+detections_df_raw <- read_csv('./data_raw/detections_df_rawALL.csv')
+effort_df_raw <- read_csv('./data_raw/effort_df_rawAll.csv')
+locs_df_raw <- read_rds('./data_raw/locations_df_raw.rds')
+
+# see available spatial layers
+list_spatial_layers()
+
+BearZones <- get_spatial_data("bear_zones")
+Counties <- get_spatial_data("counties")
+
+
+#Remove detections without Wisconsin location data
+list_nolocs <- rm_noloc_data(locs_df = locs_df_raw, effort_df = effort_df_raw, detections_df = detections_df_raw, "bear_zones", bear_mgmt_zone_id)
+
+#Remove impossible dates
+list_outsideactivedates <- rm_bad_batches(datalist=list_nolocs)
+
+#Remove low precision locations
+list_removelowpreclocs <- remove_low_precision_lat_long(list_outsideactivedates, coordinate_precision=4)
+
+#Merge close locations
+list_camsiteid <- merge_nearby_cameras(list_removelowpreclocs, cam_distance=100)
+
+#Spatially subset camera locations
+#list_spatialfilter <- spatial_subset(datalist = list_camsiteid, sf_layer = "ruffed_grouse_priority_areas",filter_statement = "rugr_pr != 'NA'")
+
+#Remove overlapping effort
+list_removeoverlap <- detect_remove_overlap(list_camsiteid)
+
+
+#Calculate daily effort
+effort_by_day_df <-
+  sswids::effort_by_day(effort = list_removeoverlap[["effort DF"]])
+
+#Calculate coordinates by cam_site_id
+mean_locs_df <-
+  sswids::average_camera_coordinates(
+    locations = list_removeoverlap[["locs DF"]],
+    effort = effort_by_day_df
+  )
+
+#Add in spatial covariates
+mean_locs_sf_layers = mean_locs_df %>%
+  st_as_sf(coords = c('lon', 'lat'), crs = 3071)
+
+mean_locs_sf_layers <-
+  st_join(
+    mean_locs_sf_layers,
+    get_spatial_data("bear_zones") %>%
+      st_transform(., st_crs(mean_locs_sf_layers)) %>%
+      st_make_valid(.),
+    
+    join = st_within
+  )
+
+#Create sampling occasions
+# set desired number of sampling occasions
+num_occasions <- 52
+# 
+effort_by_occ_df <-
+  sswids::create_sampling_occasions(
+    seasons = seasons_df,
+    effort_by_day = effort_by_day_df,
+    num_occasions = num_occasions
+  )
+
+#Calculate proportion classified by occasion
+# use all data by setting proportion classified to 0
+ppn_class_threshold = 0
+effort_by_occ_df <-
+  calculate_prop_classified(
+    seasons = seasons_df,
+    effort_day = effort_by_day_df,
+    effort_occ = effort_by_occ_df
+  )
+effort_by_occ_df <- read_rds("./data_clean/effort_by_occ_dfALL.rds")
+
+num_occasions <- 52
+day_occasion_df <-
+  seasons_df %>%
+  group_by(year) %>%
+  nest() %>%
+  # create date sequence for each year
+  mutate(date = map(data, date_sequence)) %>%
+  unnest(date) %>%
+  dplyr::select(-data) %>%
+  # using row_number give day of season starting with day 1
+  mutate(day_of_season = row_number()) %>%
+  ungroup() %>%
+  # split season into equal intervals (1-day, 3-day, ...1 week)
+  # ntile() assigns each day into a sampling occasion
+  mutate(
+    occ = ntile(day_of_season, num_occasions)
+  )
+
+Q.effort = DBI::dbGetQuery(conn,"SELECT G83100.DS_LOCATION_EFFORT.CAMERA_LOCATION_SEQ_NO,
+  G83100.DS_LOCATION_EFFORT.FINAL_DATE,
+  G83100.DS_LOCATION_EFFORT.MOTION_TRIGGER_COUNT,
+  G83100.DS_LOCATION_EFFORT.TIME_LAPSE_TRIGGER_COUNT,
+  G83100.DS_LOCATION_EFFORT.CLASS_EFFORT_TRIGGER_COUNT,
+  G83100.SSWI_CAMERA_LOCATION.ORIG_HRZ_X_COORD_AMT,
+  G83100.SSWI_CAMERA_LOCATION.ORIG_HRZ_Y_COORD_AMT,
+  G83100.SSWI_GRID_REF.DNR_GRID_ID,
+  G83100.SSWI_GRID_REF.GRID_TYPE_CODE
+FROM G83100.DS_LOCATION_EFFORT
+INNER JOIN G83100.SSWI_CAMERA_LOCATION
+ON G83100.DS_LOCATION_EFFORT.CAMERA_LOCATION_SEQ_NO = G83100.SSWI_CAMERA_LOCATION.CAMERA_LOCATION_SEQ_NO
+INNER JOIN G83100.SSWI_GRID_REF
+ON G83100.SSWI_GRID_REF.GRID_SEQ_NO       = G83100.SSWI_CAMERA_LOCATION.GRID_SEQ_NO
+WHERE G83100.SSWI_GRID_REF.GRID_TYPE_CODE = 'SSWI'")
+Q <-  filter(Q.effort, CAMERA_LOCATION_SEQ_NO %in% unique(effort_by_day_df$camera_location_seq_no))
+#Q2 = left_join(day_occasion_df, Q, by=join_by(date == FINAL_DATE))
+effort_by_day2 <- left_join(effort_by_day_df, day_occasion_df, by=join_by(date_active == date, year == year))
+Q2 = left_join(effort_by_day2, Q, by=join_by(date_active == FINAL_DATE, 
+                                             camera_location_seq_no == CAMERA_LOCATION_SEQ_NO
+))
+view(head(Q))
+view(head(Q2))
+
+Q3 <- Q2%>%group_by(cam_site_id, year, occ)%>% 
+  summarise(classified= sum(CLASS_EFFORT_TRIGGER_COUNT), total=sum(MOTION_TRIGGER_COUNT),
+            ppn_classified=classified/total)
+
+effort_by_occ_df2 <- left_join(Q3, effort_by_occ_df, by =c("cam_site_id", "year", "occ"))
+
+
+
+
+write_rds(effort_by_occ_df, "./data_clean/effort_by_occ_dfALL.rds")
+effort_by_occ_df <- read_rds("./data_clean/effort_by_occ_dfALL.rds")
+
+#Create detection histories
+detections_wide_df_maxcount <-
+  sswids::summarize_detections(
+    detections = list_removeoverlap[["detections DF"]],
+    seasons = seasons_df,
+    summary_value = "max count"
+  )
+
+detections_wide_df_counttriggers <-
+  summarize_detections(
+    detections = list_removeoverlap[["detections DF"]],
+    seasons = seasons_df,
+    summary_value = "count triggers"
+  )
+
+#Join detections, effort, and spatial information
+effort_by_occ_df_maxcount <-
+  sswids::join_detections_effort(
+    effort_by_occ = effort_by_occ_df2,
+    detections = detections_wide_df_maxcount,
+    discard_na_rows = FALSE
+  )
+
+effort_by_occ_df_counttriggers <-
+  sswids::join_detections_effort(
+    effort_by_occ = effort_by_occ_df2,
+    detections = detections_wide_df_counttriggers,
+    discard_na_rows = FALSE
+  )
+
+count triggers# merge spatial information with effort wide form 
+effort_by_occ_df_maxcount_join = effort_by_occ_df_maxcount %>%
+  full_join(mean_locs_sf_layers %>%
+              select(-c(camera_location_seq_no, bear_mgmt_unit_id , bear_mgmt_region_code)) %>%
+              distinct, .)
+
+effort_by_occ_df_counttriggers_join = effort_by_occ_df_counttriggers %>%
+  full_join(mean_locs_sf_layers %>%
+              select(-c(camera_location_seq_no, bear_mgmt_unit_id , bear_mgmt_region_code)) %>%
+              distinct,.)
+
+# save effort join files
+write_rds(effort_by_occ_df_maxcount_join,"data_clean/effort_by_occ_df_maxcount_joinALL.Rds")
+write_rds(effort_by_occ_df_counttriggers_join,"data_clean/effort_by_occ_df_counttriggers_joinALL.Rds")
+
+dfAll <- read_rds(paste(getwd(), "data_clean/effort_by_occ_df_counttriggers_joinAll.rds", sep="/"))
+
+#occasions are 7 days long
+days_active_threshold <- 4
+
+ppn_class_threshold <-  0.95
+
+df.byocc <- df %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(ppn_classified >= ppn_class_threshold) %>%
+  mutate(adult.binary = ifelse(BEAR_ADULT_AMT>0,1,0),
+         young.binary = ifelse(BEAR_YOUNG_AMT>0,1,0)) %>%
+  group_by(year,occ,bear_mgmt_zone_id) %>%
+  summarise(adult.sum = sum(BEAR_ADULT_AMT),
+            young.sum = sum(BEAR_YOUNG_AMT),
+            adult.occ = sum(adult.binary),
+            young.occ = sum(young.binary),
+            num.sites = n(),
+            num.days = sum(days_active)) %>%
+  mutate(adult.propocc = adult.occ/num.sites,
+         young.propocc = young.occ/num.sites,
+         adult.trigsperday = adult.sum/num.days,
+         young.trigsperday = young.sum/num.days) %>%
+  mutate(yearocc = paste0(year,str_pad(occ, width=2, side="left", pad="0"))) %>%
+  arrange(yearocc) %>% 
+  group_by(yearocc) %>%
+  mutate(time = cur_group_id())
+
+#By zone
+df.byocc.both1 = df.byoccAllData %>%
+  select(time,year,occ,bear_mgmt_zone_id,
+         adult.propocc) %>%
+  pivot_longer(cols=c(adult.propocc))
+
+df.byocc.both2 <- filter(df.byocc.both1, bear_mgmt_zone_id %in% c("A","B","C","D"))
+
+#52 occasions of 7
+year.lines = seq(1,261,52)
+year.ticks = seq(26,260,52)
+
+
+  ggplot(filter(df.byocc.both1, name == "adult.propocc"),aes_string(x="time",y="value",col="name")) +
+  facet_wrap(~bear_mgmt_zone_id) +#,scales = c("free_y")) +
+  geom_smooth(span=0.1, lwd=0.3,se=FALSE) + 
+  stat_smooth() + #
+  geom_vline(xintercept=year.lines) +
+  theme(legend.position="right",
+        axis.ticks.x=element_blank()) +
+  labs(title=str_wrap("Proportion of Snapshot camera sites with bear detections",75),
+       y = "Proportion of sites",
+       x = "Time",
+       subtitle = "Year Round, 2019 - 2023") +
+  scale_x_continuous(breaks = year.ticks,
+                     labels = seq(2019,2023,1)) +
+    #coord_cartesian(xlim=c(53,312), expand = FALSE) +
+    ylim(0,0.3) +
+     theme(legend.position="none")
+
+```
+
+
+## New Workflow
+```{r, eval=FALSE}
+sswids::connect_to_sswidb(db_version = 'PROD')
+
+grid <- "SSWI"
+prec <- 0
+#can specify dates either way, some flexibility in function
+daterange <- as.Date(c("2022-01-22", "2022-06-30"))
+daterange2 <-
+  create_season_dates(
+    min_date = "-01-01",
+    max_date = "-12-31",
+    years = c(2019,2022)
+  )
+
+Q <- query_effort(conn = conn, prec = prec, grid = grid, daterange = daterange2, remove0Timelapse = TRUE)
+#removes location in UP, location in middle of lake and locations without needed precision
+Q2 <- rm_bad_locations(locationeffort = Q, coordinate_precision = 4)
+#assigns camsite id, creates average location coordinates, removes overlapping effort of more than 1 day
+Q3 <- merge_nearby_cameras(locationeffort = Q2, cam_distance = 100)
+#pull in detections
+rawdetections <- query_detections(conn = conn, species = c("Bear", "Elk"), grid = "SSWI", daterange = daterange2, prec = 0)
+#summarize effort by sampling occasions make prop_classified column
+Q4 <-create_sampling_occasions(daterange = daterange2, locationeffort = Q3, num_occasions = 52, class_threshold =  0.95)
+#join effort and detections data, summarize detections by occasion
+Q5 <- summarize_detections(detections = rawdetections, locationeffort = Q4, summary_value = "max count")
+
+spatial_plot()
+temporal_plots <- temporal_plot(conn, df = dfFur, mgmtlayer="furbearer_zones", days_active_threshold = 4, ppn_class_threshold = 0.95, spatialgroup = "zone")
+```
+
+

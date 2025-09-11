@@ -1,0 +1,53 @@
+---
+title: "BearDeerTurkey"
+output: html_document
+date: "2025-09-08"
+---
+
+```{r setup, include=FALSE}
+library(sswids)
+library(sf)
+library(dplyr)
+library(tidyselect)
+library(ggplot2)
+
+sswids::connect_to_sswidb(db_version = 'PROD')
+
+BearDeerTurkey0.95 <- readRDS("./BearDeerTurkeyList.rds")
+
+Bear <- BearDeerTurkey0.95[["Bear"]]
+Deer <- BearDeerTurkey0.95[["Deer"]]%>%st_join(get_spatial_data("dmus")%>%st_transform(., 4326))%>%select(-c(18,19,21:25))
+Turkey <- BearDeerTurkey0.95[["Turkey"]]
+
+tempplotBear0.95 <- temporal_plot(conn = conn, df = Bear, mgmtlayer = "bear_zones", days_active_threshold = 4, ppn_class_threshold = 0.95, spatialgroup = "bear_mgmt_zone_id")
+tempplotDeer0.95 <- temporal_plot(conn = conn, df = Deer, mgmtlayer = "dmus", days_active_threshold = 4, ppn_class_threshold = 0.95, spatialgroup = "DEER_MANAGEMENT_ZONE")
+templotDeerClasses <- temporal_plot(conn = conn, df = Deer, mgmtlayer = "dmus", days_active_threshold = 4, ppn_class_threshold = 0.95, spatialgroup = "DEER_MANAGEMENT_ZONE", combine_cols = FALSE)
+tempplotTurkey0.95 <- temporal_plot(conn = conn, df = Turkey, mgmtlayer = "turkey_mgt_zones", days_active_threshold = 4, ppn_class_threshold = 0.95, spatialgroup = "turkey_mgmt_unit_id")
+
+
+spatialplotBear0.95 <- spatial_plot(conn=conn, df=Bear, mgmtlayer = "bear_zones", days_active_threshold = 4,ppn_class_threshold = 0.95, spatialgroup = "bear_mgmt_zone_id", n_occasions_annual = 26)
+spatialplotDeer0.95 <- spatial_plot(conn=conn, df=Deer, mgmtlayer = "dmus", days_active_threshold = 4,ppn_class_threshold = 0.95, spatialgroup = "DEER_MANAGEMENT_ZONE", n_occasions_annual = 26)
+spatialplotDeerClasses <- spatial_plot(conn=conn, df=Deer, mgmtlayer = "dmus", days_active_threshold = 4,ppn_class_threshold = 0.95, spatialgroup = "DEER_MANAGEMENT_ZONE", n_occasions_annual = 26, combine_cols = FALSE)
+spatialplotTurkey0.95 <- spatial_plot(conn=conn, df=Turkey, mgmtlayer = "turkey_mgt_zones", days_active_threshold = 4,ppn_class_threshold = 0.95, spatialgroup = "turkey_mgmt_unit_id", n_occasions_annual = 26)
+
+spatialplotBear0.95County <- spatial_plot(conn=conn, df=Bear, days_active_threshold = 4,ppn_class_threshold = 0.95, n_occasions_annual = 26)
+spatialplotDeer0.95County <- spatial_plot(conn=conn, df=Deer, days_active_threshold = 4,ppn_class_threshold = 0.95, n_occasions_annual = 26)
+spatialplotTurkey0.95County <- spatial_plot(conn=conn, df=Turkey, days_active_threshold = 4,ppn_class_threshold = 0.95, n_occasions_annual = 26)
+```
+
+
+## Bear
+```{r}
+
+```
+
+## Deer
+```{r}
+
+```
+
+## Turkey
+```{r}
+
+```
+
