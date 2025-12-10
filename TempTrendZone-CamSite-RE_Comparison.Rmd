@@ -1,0 +1,496 @@
+---
+title: "Temp Trends Zone vs Cam Site vs RE"
+output: html_document
+date: "2025-12-04"
+---
+
+```{r setup, include=FALSE}
+library(sf)
+library(mgcv)
+library(dplyr)
+library(gratia)
+library(ggplot2)
+library(modelbased)
+library(insight)
+library(performance)
+library(purrr)
+library(landscapemetrics)
+library(sswids)
+library(terra)
+library(readxl)
+library(tidyr)
+library(DBI)
+
+sswids::connect_to_sswidb(db_version = 'PROD')
+
+Turkey1week <- readRDS("./TurkeyCPUE_CT.rds")
+#get rid of occasions with 2 different camera versions
+Turkey1week <- Turkey1week%>%filter(!grepl(x = camera_version, pattern = ","))
+
+#occasions are 7 days long
+days_active_threshold <- 4
+
+ppn_class_threshold <-  0.95
+
+Turkey2 <- Turkey1week %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(prop_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), 
+                ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}"),
+         lat=scale(st_coordinates(.)[,2]),
+         lon=scale(st_coordinates(.)[,1]),
+         camera_version2=as.factor(ifelse(camera_version == "V4", 2, 1)))%>%
+  rename(zone=turkey_mgmt_unit_id)%>%st_drop_geometry()
+
+Turkey2$zone <- as.factor(Turkey2$zone)
+Turkey2$camera_version <- as.factor(Turkey2$camera_version)
+levels(Turkey2$camera_version)
+Turkey2$cam_site_id <- as.factor(Turkey2$cam_site_id)
+Turkey2$year <- Turkey2$season+2018
+```
+
+```{r ForestProp}
+ForestProp <- function(camsites, buffers, layer){
+  # Wiscland 3 prop land cover
+  lm_output <- 
+    buffers %>% 
+    set_names() %>% 
+    # produce a dataframe after this is all done
+    map_dfr( 
+      ~sample_lsm(
+        # raster layer
+        landscape = layer,
+        # camera locations
+        y = camsites,
+        # get landcover class level metrics
+        level = "class",
+        # return NA values for classes not in buffer
+        # all_classes = TRUE, 
+        # camera site IDs here
+        plot_id = camsites$cam_site_id,
+        # can do multiple metrics at once
+        what = 'lsm_c_pland',
+        # buffer sizes to use
+        size = ., 
+        # default is square buffer
+        shape = "circle", 
+        # turn warnings on or off
+        verbose = FALSE 
+      ), 
+      # get buffer size column in the output
+      .id = "buffer_size"
+    )
+  
+  lm_output <- left_join(lm_output, WisclandGuide, by= join_by(class == dn.label))
+  lm_output$label <- gsub(pattern = "\\W", replacement = "", x = lm_output$label)
+  
+  # in this data frame plot_id = camera ID
+  # class = landcover type
+  # value = % of that landcover type in the buffer
+  # make each landcover type x buffer into a column
+  lm_output <- 
+    lm_output %>%
+    # MAY NEED TO ADD distinct() HERE???
+    #distinct() %>% # this removes duplicate rows before pivot. Not sure why there are duplicate rows in the first place
+    pivot_wider(
+      id_cols = plot_id,
+      names_from = c(label, buffer_size),
+      values_from = c(value),
+      # give class 0 if it doesn't exist in buffer
+      values_fill = 0
+    ) %>%
+    # clean up names
+    rename(cam_site_id = plot_id)
+  
+  
+  # join pland back to camera sf object
+  forestLCs <- c("AspenPaperBirch", "RedMaple", "Oak", "CentralHardwoods", "NorthernHardwoods","AspenForestedWetland", "BottomlandHardwoods", "SwampHardwoods",
+                 "MixedDeciduousConiferousForest", "MixedDeciduousConiferousForestedWetland")
+  
+  lm_output2 <- cbind(lm_output, lapply(buffers, function(x) rowSums(lm_output[,paste0(forestLCs, "_", x)])))
+  forestcols <- grep(pattern = "c\\(", x = colnames(lm_output2))
+  colnames(lm_output2)[forestcols] <- paste0("Forest", "_",buffers)
+  
+  ForestProp <- lm_output2[,c(1,forestcols)]
+  camsites <- left_join(camsites, ForestProp, by="cam_site_id")
+}
+```
+
+## Covs for camera sites
+```{r covs}
+
+#get just camsites for adding in covariates
+camsites <- Turkey1week%>%select(cam_site_id)%>%distinct()%>%st_transform(., 3071)
+
+
+Wiscland3 <- get_spatial_data(layer_name = 'wiscland2', level = 3)
+Wiscland3.3071 <- project(Wiscland3, "EPSG:3071")
+WisclandGuide <- read_xlsx("C:/Users/wildeefb/Documents/GeoSpatial/wiscland2/user_guide/Wiscland2 Color Scheme.xlsx",
+                           range = "B2:C70", .name_repair = make.names)
+
+
+buffers <- c(5000, 8000)
+
+camsites <- ForestProp(camsites = camsites, buffers = buffers, layer = Wiscland3.3071)
+
+
+
+trailtype <- dbGetQuery(conn, "SELECT DISTINCT
+g83100.sswi_metadata.metadata_text,
+g83100.sswi_metadata.metadata_group_code,
+g83100.sswi_metadata.metadata_name,
+g83100.sswi_camera_location.camera_location_seq_no
+FROM
+g83100.sswi_metadata
+INNER JOIN g83100.sswi_event ON g83100.sswi_metadata.event_seq_no = g83100.sswi_event.event_seq_no
+INNER JOIN g83100.sswi_camera_location ON g83100.sswi_event.event_seq_no = g83100.sswi_camera_location.event_seq_no
+WHERE
+g83100.sswi_metadata.metadata_name = 'TRAVEL_CORRIDOR_TYPE_CODE'")%>%
+  mutate(CAMERA_LOCATION_SEQ_NO=as.character(CAMERA_LOCATION_SEQ_NO))%>%
+  rename(camera_location_seq_no = CAMERA_LOCATION_SEQ_NO, trailtype=METADATA_TEXT)
+trailtype[!is.na(trailtype$METADATA_NAME) & is.na(trailtype$trailtype),]$trailtype <- "None"
+
+
+Turkey3 <- left_join(Turkey2, camsites)
+Turkey3 <- Turkey3%>%mutate(across(matches("Forest"), scale))
+longerdelim <- tidyr::separate_longer_delim(Turkey3, camera_location_seq_no, delim = ",")
+Turkey4 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -camera_location_seq_no)))%>%
+  summarise(camera_location_seq_no=paste(unique(camera_location_seq_no),collapse =","),
+            trailtype=paste(unique(trailtype),collapse =","))%>%ungroup()
+Turkey5 <- Turkey4%>%filter(trailtype %in% c("GT", "MT"))
+Turkey5$trailtype <- as.factor(Turkey5$trailtype)
+```
+
+## GAM with Zone-Aggregated Data
+```{r ZoneGam}
+daterange <- Turkey2%>%group_by(season)%>% #recreate date ranges from data frame
+  dplyr::summarise(start_date=as.Date(min(start_date)), end_date=as.Date(max(end_date)))%>%
+  sf::st_drop_geometry()
+
+df.byocc <- Turkey2 %>%
+  filter(days_active >= 4) %>%
+  filter(prop_classified >= 0.95) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,zone) %>%
+  dplyr::summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+                   across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+                   num.sites = dplyr::n(),
+                   num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days,
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(lubridate::year(min(daterange$start_date))+(season-1),stringr::str_pad(occ, width=2, side="left", pad="0"))) %>%
+  dplyr::arrange(yearocc) %>%
+  group_by(yearocc) %>%
+  mutate(time = dplyr::cur_group_id())
+
+df.byocc.long = df.byocc %>%
+  select(time, season,occ,zone,num.sites,
+         matches("_occ")) %>%
+  tidyr::pivot_longer(cols=matches("_occ"), names_pattern  = "(.*)_occ", names_to = "Spp")%>%
+  mutate(year=season+2018) #this may need to be modified
+
+df.byocc.long$zone <- as.factor(df.byocc.long$zone)
+df.byocc.long$binomresponse <- with(df.byocc.long, cbind(value, num.sites - value))
+
+nocc <- length(unique(df.byocc.long$occ))
+knots <- list(occ = c(0.5, nocc+0.5))
+nyears <- length(unique(df.byocc.long$season))
+
+
+#model with year x occ interaction as well as occ x zone interaction
+ZoneGam <- mgcv::gam(binomresponse ~ zone + s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
+                   ti(season, occ, bs = c("tp", "cc")),
+                 data = df.byocc.long,
+                 family = binomial,
+                 knots = knots)
+
+avgTurkeyGAM <- estimate_means(ZoneGam, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyGAM <- estimate_means(ZoneGam, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
+```
+
+## GAM with camera site data
+```{r BAM camsite}
+TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+                         s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
+                         ti(season, occ, bs = c("tp", "cc")),
+                       data = Turkey5,
+                       family = "poisson",
+                       knots = knots,
+                       discrete=TRUE,
+                         nthreads=2)
+
+summary(TurkeyBam, re.test=FALSE)
+
+avgTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=occ+nocc*(season-1))
+```
+
+
+## GAM with camera site data and random effects
+```{r BAM RE}
+TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+                           s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) + s(cam_site_id, bs = "re") +
+                           ti(season, occ, bs = c("tp", "cc")),
+                         data = Turkey5,
+                         family = "poisson",
+                         knots = knots,
+                         discrete=TRUE,
+                         nthreads=2)
+
+summary(TurkeyBamRE, re.test=FALSE)
+
+avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ"), estimate="average", discrete=TRUE, n.threads=2)%>%mutate(time=occ+nocc*(season-1))#1410-1506
+```
+
+## Zone GAM plot
+```{r GAM plot}
+ggplot() +
+  geom_line(data=occTurkeyGAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyGAM, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyGAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```
+
+
+## Camera Site BAM plot
+```{r BAM plot}
+ggplot() +
+  geom_line(data=occTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```
+
+## Camera Site BAM plot with Random Effects
+```{r BAM RE plot}
+ggplot() +
+  geom_line(data=occTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAMRE, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```
+
+
+# 2 Week
+```{r 2 week set up}
+BearBobTurkeyList <- readRDS("./BearBobTurkeyList.rds")
+Turkey2week <- BearBobTurkeyList[["Turkey"]]
+Turkey2week <- Turkey2week%>%filter(!grepl(x = camera_version, pattern = ","))
+
+
+#occasions are 7 days long
+days_active_threshold <- 8
+
+ppn_class_threshold <-  0.95
+
+Turkey2 <- Turkey2week %>%
+  filter(days_active >= days_active_threshold) %>%
+  filter(prop_classified >= ppn_class_threshold) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), 
+                ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}"),
+         lat=scale(st_coordinates(.)[,2]),
+         lon=scale(st_coordinates(.)[,1]),
+         camera_version2=as.factor(ifelse(camera_version == "V4", 2, 1)))%>%
+  rename(zone=turkey_mgmt_unit_id)%>%st_drop_geometry()
+
+Turkey2$zone <- as.factor(Turkey2$zone)
+Turkey2$camera_version <- as.factor(Turkey2$camera_version)
+levels(Turkey2$camera_version)
+Turkey2$cam_site_id <- as.factor(Turkey2$cam_site_id)
+Turkey2$year <- Turkey2$season+2018
+```
+
+## Covs for camera sites
+```{r covs 2week}
+
+#get just camsites for adding in covariates
+camsites2week <- Turkey2%>%select(cam_site_id)%>%distinct()%>%st_transform(., 3071)
+
+camsites2week <- ForestProp(camsites = camsites2week, buffers = buffers, layer = Wiscland3.3071)
+
+
+Turkey3 <- left_join(Turkey2, camsites2week)
+Turkey3 <- Turkey3%>%mutate(across(matches("Forest"), scale))
+longerdelim <- tidyr::separate_longer_delim(Turkey3, camera_location_seq_no, delim = ",")
+Turkey4 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -camera_location_seq_no)))%>%
+  summarise(camera_location_seq_no=paste(unique(camera_location_seq_no),collapse =","),
+            trailtype=paste(unique(trailtype),collapse =","))%>%ungroup()
+Turkey5 <- Turkey4%>%filter(trailtype %in% c("GT", "MT"))
+```
+
+## GAM with Zone-Aggregated Data
+```{r ZoneGam 2week}
+daterange <- Turkey2%>%group_by(season)%>% #recreate date ranges from data frame
+  dplyr::summarise(start_date=as.Date(min(start_date)), end_date=as.Date(max(end_date)))%>%
+  sf::st_drop_geometry()
+
+df.byocc <- Turkey2 %>%
+  filter(days_active >= 4) %>%
+  filter(prop_classified >= 0.95) %>%
+  mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~ifelse(.>0,1,0), .names = "{sub('_AMT', '_binary',col)}")) %>%
+  group_by(season,occ,zone) %>%
+  dplyr::summarise(across(matches("[A-Z]*_AMT", ignore.case = FALSE), ~sum(.),.names = "{sub('_AMT', '_sum',col)}"),
+                   across(matches("[A-Z]*_binary", ignore.case = FALSE), ~sum(.),.names = "{sub('_binary', '_occ',col)}"),
+                   num.sites = dplyr::n(),
+                   num.days = sum(days_active)) %>%
+  mutate(across(matches("[A-Z]*_occ", ignore.case = FALSE), ~./num.sites,.names = "{sub('_occ', '_propocc',col)}"),
+         across(matches("[A-Z]*_sum", ignore.case = FALSE), ~./num.days,
+                .names = "{sub('_sum','_trigsperday',col)}"))%>%
+  mutate(yearocc = paste0(lubridate::year(min(daterange$start_date))+(season-1),stringr::str_pad(occ, width=2, side="left", pad="0"))) %>%
+  dplyr::arrange(yearocc) %>%
+  group_by(yearocc) %>%
+  mutate(time = dplyr::cur_group_id())
+
+df.byocc.long = df.byocc %>%
+  select(time, season,occ,zone,num.sites,
+         matches("_occ")) %>%
+  tidyr::pivot_longer(cols=matches("_occ"), names_pattern  = "(.*)_occ", names_to = "Spp")%>%
+  mutate(year=season+2018) #this may need to be modified
+
+df.byocc.long$zone <- as.factor(df.byocc.long$zone)
+df.byocc.long$binomresponse <- with(df.byocc.long, cbind(value, num.sites - value))
+
+nocc <- length(unique(df.byocc.long$occ))
+knots <- list(occ = c(0.5, nocc+0.5))
+nyears <- length(unique(df.byocc.long$season))
+
+
+#model with year x occ interaction as well as occ x zone interaction
+ZoneGam <- mgcv::gam(binomresponse ~ zone + s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
+                   ti(season, occ, bs = c("tp", "cc")),
+                 data = df.byocc.long,
+                 family = binomial,
+                 knots = knots)
+
+avgTurkeyGAM <- estimate_means(ZoneGam, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyGAM <- estimate_means(ZoneGam, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
+```
+
+## GAM with camera site data
+```{r BAM camsite 2week}
+TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+                         s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
+                         ti(season, occ, bs = c("tp", "cc")),
+                       data = Turkey5,
+                       family = "poisson",
+                       knots = knots)
+
+summary(TurkeyBam, re.test=FALSE)
+
+avgTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
+```
+
+
+## GAM with camera site data and random effects
+```{r BAM RE 2week}
+TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+                           s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) + s(cam_site_id, bs = "re") +
+                           ti(season, occ, bs = c("tp", "cc")),
+                         data = Turkey5,
+                         family = "poisson",
+                         knots = knots,
+                         discrete=TRUE,
+                         nthreads=2)
+
+summary(TurkeyBamRE, re.test=FALSE)
+
+avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
+```
+
+## Zone GAM plot
+```{r GAM plot 2week}
+ggplot() +
+  geom_line(data=occTurkeyGAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyGAM, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyGAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```
+
+
+## Camera Site BAM plot
+```{r BAM plot 2week}
+ggplot() +
+  geom_line(data=occTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```
+
+## Camera Site BAM plot with Random Effects
+```{r BAM RE plot 2week}
+ggplot() +
+  geom_line(data=occTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAMRE, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
+       y = "Avg. Turkey Triggers/week",
+       x = "Time",
+       subtitle = sprintf("Year Round, %s - %s", 2019, 2024)) +
+  geom_vline(xintercept=seq(1,(nocc+1)*nyears,nocc)) +
+  scale_x_continuous(labels = seq(2019,2024,1), breaks = seq(nocc/2,nocc*nyears,nocc)) +
+  scale_color_brewer(palette = "Set2",
+                     name = "Zone",
+                     labels = levels(Turkey2$zone)) +
+  scale_fill_brewer(palette = "Set2",
+                    name = "Zone",
+                    labels = levels(Turkey2$zone))
+```

@@ -16,7 +16,7 @@ library(DBI)
 
 sswids::connect_to_sswidb(db_version = 'PROD')
 
-Turkey <- readRDS("./TurkeyCPUE_CT.rds")
+Turkey1week <- readRDS("./TurkeyCPUE_CT.rds")
 BearBobTurkeyList <- readRDS("./BearBobTurkeyList.rds")
 Turkey2week <- BearBobTurkeyList[["Turkey"]]
 
@@ -39,19 +39,24 @@ newocc <- data.frame(occ=1:52, occ2week=rep(1:26, each=2))
 
 buffers <- c(5000, 8000)
 
-camsites <- Forest
+camsites <- ForestProp(camsites = camsites, buffers = buffers, layer = Wiscland3.3071)
+camsites2week <- ForestProp(camsites = camsites2week, buffers = buffers, layer = Wiscland3.3071)
 
-trailtype <- dbGetQuery(conn, "SELECT
-g83100.sswi_metadata.metadata_name,
+trailtype <- dbGetQuery(conn, "SELECT DISTINCT
 g83100.sswi_metadata.metadata_text,
+g83100.sswi_metadata.metadata_group_code,
+g83100.sswi_metadata.metadata_name,
 g83100.sswi_camera_location.camera_location_seq_no,
-g83100.sswi_event.event_seq_no
 FROM
 g83100.sswi_metadata
 INNER JOIN g83100.sswi_event ON g83100.sswi_metadata.event_seq_no = g83100.sswi_event.event_seq_no
 INNER JOIN g83100.sswi_camera_location ON g83100.sswi_event.event_seq_no = g83100.sswi_camera_location.event_seq_no
 WHERE
-g83100.sswi_metadata.metadata_name = 'TRAVEL_CORRIDOR_TYPE_CODE'")
+g83100.sswi_metadata.metadata_name = 'TRAVEL_CORRIDOR_TYPE_CODE'")%>%
+  mutate(CAMERA_LOCATION_SEQ_NO=as.character(CAMERA_LOCATION_SEQ_NO))%>%
+  rename(camera_location_seq_no = CAMERA_LOCATION_SEQ_NO, trailtype=METADATA_TEXT)
+trailtype[!is.na(trailtype$METADATA_NAME) & is.na(trailtype$trailtype),]$trailtype <- "None"
+trailtype$trailtype <- as.factor(trailtype$trailtype)
 
 #occasions are 7 days long
 days_active_threshold <- 8
@@ -67,6 +72,7 @@ Turkey2 <- Turkey2week %>%
          lon=scale(st_coordinates(.)[,1]),
          camera_version2=as.factor(ifelse(camera_version == "V4", 2, 1)))%>%
   rename(zone=turkey_mgmt_unit_id)%>%st_drop_geometry()
+
 Turkey2$zone <- as.factor(Turkey2$zone)
 Turkey2$camera_version <- as.factor(Turkey2$camera_version)
 levels(Turkey2$camera_version)
@@ -74,27 +80,48 @@ Turkey2$cam_site_id <- as.factor(Turkey2$cam_site_id)
 Turkey2$year <- Turkey2$season+2018
 Turkey3 <- left_join(Turkey2, camsites)
 Turkey3 <- Turkey3%>%mutate(across(matches("Forest"), scale))
+longerdelim <- tidyr::separate_longer_delim(Turkey3, camera_location_seq_no, delim = ",")
+Turkey4 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -camera_location_seq_no)))%>%
+  summarise(camera_location_seq_no=paste(unique(camera_location_seq_no),collapse =","),
+            trailtype=paste(unique(trailtype),collapse =","))%>%ungroup()
+Turkey5 <- Turkey4%>%filter(trailtype %in% c("GT", "MT"))
 
 
-nocc <- length(unique(Turkey2$occ))
+
+nocc <- length(unique(Turkey4$occ))
 knots <- list(occ = c(0.5, nocc+0.5))
-nyears <- length(unique(Turkey2$season))
+nyears <- length(unique(Turkey4$season))
 
 start <- Sys.time()
-TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + s(lat, lon, k=60) + s(Forest_5000, k=12) +
+TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
                          s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
                          ti(season, occ, bs = c("tp", "cc")),
-                       data = Turkey3,
-                       family = ziP(),
+                       data = Turkey5,
+                       family = "poisson",
                        knots = knots) #9:51
+TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+                           s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) + s(cam_site_id, bs = "re") +
+                           ti(season, occ, bs = c("tp", "cc")),
+                         data = Turkey5,
+                         family = "poisson",
+                         knots = knots,
+                         discrete=TRUE,
+                         nthreads=2)#11:37-11:41
 TurkeyBam2 <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2  + 
                           s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
                           ti(season, occ, bs = c("tp", "cc")),
-                        data = Turkey3,
+                        data = Turkey5,
                         family = nb(),
                         knots = knots) #9:51
 
-
+summary(TurkeyBam)
+summary(TurkeyBamRE, re.test=FALSE)
+draw(TurkeyBamRE)
+k.check(TurkeyBam)
+gam.check(TurkeyBamRE)
+summary(TurkeyBam2)
+check_overdispersion(TurkeyBam)
+check_zeroinflation(TurkeyBam)
 end <- Sys.time()
 end-start
 ##############################################################################################################################
@@ -160,8 +187,8 @@ gam.check(TurkeyBam)
 
 gratia::draw(TurkeyBam)
 variance_comp(TurkeyBam)
-meansTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"))%>%mutate(time=(nocc/2)+nocc*(season-1))
-avgTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+meansTurkeyBAM <- estimate_means(TurkeyBamRE, by = c("zone", "season"))%>%mutate(time=(nocc/2)+nocc*(season-1))
+avgTurkeyBAM <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
 occTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
 occTurkeyBAM2 <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"), estimate = "average")#takes a while
 occTurkeyBAM3 <- occTurkeyBAM2%>%mutate(time=occ+nocc*(season-1))
@@ -249,7 +276,7 @@ ForestProp <- function(camsites, buffers, layer){
     set_names() %>% 
     # produce a dataframe after this is all done
     map_dfr( 
-      ~sample_lsm(
+      in_parallel(~sample_lsm(
         # raster layer
         landscape = layer,
         # camera locations
@@ -268,7 +295,7 @@ ForestProp <- function(camsites, buffers, layer){
         shape = "circle", 
         # turn warnings on or off
         verbose = FALSE 
-      ), 
+      )), 
       # get buffer size column in the output
       .id = "buffer_size"
     )
@@ -306,3 +333,38 @@ ForestProp <- function(camsites, buffers, layer){
   ForestProp <- lm_output2[,c(1,forestcols)]
   camsites <- left_join(camsites, ForestProp, by="cam_site_id")
 }
+
+
+###################################################################################################################################
+####                                                    scrap                                                             #########
+###################################################################################################################################
+multicamocc <- Turkey3[grep(x = Turkey3$camera_location_seq_no, pattern=","),]
+longerdelim <- tidyr::separate_longer_delim(multicamocc, camera_location_seq_no, delim = ",")
+multicamocc2 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -camera_location_seq_no)))%>%
+  summarise(camera_location_seq_no=paste(unique(camera_location_seq_no),collapse =","),
+            trailtype=paste(unique(trailtype),collapse =","))
+
+table(Turkey4$METADATA_TEXT, useNA="always")
+NAtrailtype <- Turkey4[which(is.na(Turkey4$METADATA_TEXT)),]
+multicamlocs <- Turkey4[grep(x=Turkey4$camera_location_seq_no, pattern=","),]
+
+
+CLSN89677 <- dbGetQuery(conn, "SELECT *
+FROM
+g83100.sswi_metadata
+WHERE
+g83100.sswi_metadata.camera_location_seq_no = 89677")
+
+trailtype <- dbGetQuery(conn, "SELECT DISTINCT
+g83100.sswi_metadata.metadata_text,
+g83100.sswi_metadata.metadata_group_code,
+g83100.sswi_metadata.metadata_name,
+g83100.sswi_camera_location.camera_location_seq_no
+FROM
+g83100.sswi_metadata
+INNER JOIN g83100.sswi_event ON g83100.sswi_metadata.event_seq_no = g83100.sswi_event.event_seq_no
+INNER JOIN g83100.sswi_camera_location ON g83100.sswi_event.event_seq_no = g83100.sswi_camera_location.event_seq_no
+WHERE
+g83100.sswi_metadata.metadata_name = 'TRAVEL_CORRIDOR_TYPE_CODE'")%>%
+  mutate(CAMERA_LOCATION_SEQ_NO=as.character(CAMERA_LOCATION_SEQ_NO))%>%
+  rename(camera_location_seq_no = CAMERA_LOCATION_SEQ_NO, trailtype=METADATA_TEXT)
