@@ -25,7 +25,7 @@ Turkey2week <- BearBobTurkeyList[["Turkey"]]
 ##############################################################################################################
 Turkey <- Turkey%>%filter(!grepl(x = camera_version, pattern = ","))
 Turkey2week <- Turkey2week%>%filter(!grepl(x = camera_version, pattern = ","))
-camsites <- Turkey%>%select(cam_site_id)%>%distinct()%>%st_transform(., 3071)
+camsites <- Turkey1week%>%select(cam_site_id)%>%distinct()%>%st_transform(., 3071)
 camsites2week <- Turkey2week%>%select(cam_site_id)%>%distinct()%>%st_transform(., 3071)
 
 Wiscland3 <- get_spatial_data(layer_name = 'wiscland2', level = 3)
@@ -46,7 +46,7 @@ trailtype <- dbGetQuery(conn, "SELECT DISTINCT
 g83100.sswi_metadata.metadata_text,
 g83100.sswi_metadata.metadata_group_code,
 g83100.sswi_metadata.metadata_name,
-g83100.sswi_camera_location.camera_location_seq_no,
+g83100.sswi_camera_location.camera_location_seq_no
 FROM
 g83100.sswi_metadata
 INNER JOIN g83100.sswi_event ON g83100.sswi_metadata.event_seq_no = g83100.sswi_event.event_seq_no
@@ -59,11 +59,11 @@ trailtype[!is.na(trailtype$METADATA_NAME) & is.na(trailtype$trailtype),]$trailty
 trailtype$trailtype <- as.factor(trailtype$trailtype)
 
 #occasions are 7 days long
-days_active_threshold <- 8
+days_active_threshold <- 4
 
 ppn_class_threshold <-  0.95
 
-Turkey2 <- Turkey2week %>%
+Turkey2 <- Turkey1week %>%
   filter(days_active >= days_active_threshold) %>%
   filter(prop_classified >= ppn_class_threshold) %>%
   mutate(across(matches("[A-Z]*_AMT", ignore.case = FALSE), 
@@ -73,10 +73,8 @@ Turkey2 <- Turkey2week %>%
          camera_version2=as.factor(ifelse(camera_version == "V4", 2, 1)))%>%
   rename(zone=turkey_mgmt_unit_id)%>%st_drop_geometry()
 
-Turkey2$zone <- as.factor(Turkey2$zone)
-Turkey2$camera_version <- as.factor(Turkey2$camera_version)
+
 levels(Turkey2$camera_version)
-Turkey2$cam_site_id <- as.factor(Turkey2$cam_site_id)
 Turkey2$year <- Turkey2$season+2018
 Turkey3 <- left_join(Turkey2, camsites)
 Turkey3 <- Turkey3%>%mutate(across(matches("Forest"), scale))
@@ -85,20 +83,27 @@ Turkey4 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -ca
   summarise(camera_location_seq_no=paste(unique(camera_location_seq_no),collapse =","),
             trailtype=paste(unique(trailtype),collapse =","))%>%ungroup()
 Turkey5 <- Turkey4%>%filter(trailtype %in% c("GT", "MT"))
-
-
+Turkey5$cam_site_id <- as.factor(Turkey5$cam_site_id)
+Turkey5$zone <- as.factor(Turkey5$zone)
+Turkey5$camera_version <- as.factor(Turkey5$camera_version)
+Turkey5$trailtype <- as.factor(Turkey5$trailtype)
+Turkey5$Forest_5000sc <- as.numeric(Turkey5$Forest_5000)
+Turkey5$latsc <- as.numeric(Turkey5$lat)
+Turkey5$lonsc <- as.numeric(Turkey5$lon)
 
 nocc <- length(unique(Turkey4$occ))
 knots <- list(occ = c(0.5, nocc+0.5))
 nyears <- length(unique(Turkey4$season))
 
 start <- Sys.time()
-TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
+TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(latsc, lonsc, k=60) + s(Forest_5000sc, k=12) + 
                          s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) +
                          ti(season, occ, bs = c("tp", "cc")),
                        data = Turkey5,
                        family = "poisson",
-                       knots = knots) #9:51
+                       knots = knots,
+                       discrete=TRUE,
+                       nthreads=2) #9:51
 TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, lon, k=60) + s(Forest_5000, k=12) + 
                            s(season, k=nyears, by=zone) + s(occ, bs = "cc", k=nocc, by=zone) + s(cam_site_id, bs = "re") +
                            ti(season, occ, bs = c("tp", "cc")),
@@ -113,6 +118,49 @@ TurkeyBam2 <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2  +
                         data = Turkey5,
                         family = nb(),
                         knots = knots) #9:51
+
+tic()
+p1 <- predictions(TurkeyBamRE, vcov = FALSE)
+toc()
+
+automatic_differentiation <- function() {
+  autodiff(TRUE)
+  avg_predictions(TurkeyBamRE, by = c("zone", "season"))
+}
+finite_differences <- function() {
+  autodiff(FALSE)
+  avg_predictions(TurkeyBamRE, by = c("zone", "season"))
+}
+microbenchmark(
+  automatic_differentiation(),
+  finite_differences(),
+  times = 5
+)
+
+cores <- 4
+plan(multisession, workers = cores)
+## 8 GB memory
+options(future.globals.maxSize = 8000 * 1024^2) 
+
+options("marginaleffects_parallel" = TRUE)
+tic()
+yearmean <- avg_predictions(TurkeyBam, by=c("zone", "season"))
+toc()
+
+plan(sequential)
+options("marginaleffects_parallel" = FALSE)
+tic()
+predictions(TurkeyBam, by = c("zone", "season"))
+toc()
+
+tic()
+occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ=c(4,8,12,16,20,24,28,32,36,40,44,48,52)"), estimate="average")%>%mutate(time=occ+nocc*(season-1))
+toc()
+
+
+tic()
+avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))
+toc()
 
 summary(TurkeyBam)
 summary(TurkeyBamRE, re.test=FALSE)
@@ -233,9 +281,9 @@ plottemp
 
 
 ggplot() +
-  geom_line(data=occTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
-  geom_line(data=avgTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=2) +
-  geom_pointrange(data=avgTurkeyBAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  geom_line(data=occTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAMRE, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
   labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
        y = "Avg. Turkey Triggers/week",
        x = "Time",
@@ -251,9 +299,9 @@ ggplot() +
 
 ggplot() +
   facet_wrap(~zone)+
-  geom_line(data=occTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=0.5) +
-  geom_line(data=avgTurkeyBAM, aes(x = time, y = Mean, color=zone), lwd=2) +
-  geom_pointrange(data=avgTurkeyBAM, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
+  geom_line(data=occTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=0.5) +
+  geom_line(data=avgTurkeyBAMRE, aes(x = time, y = Mean, color=zone), lwd=2) +
+  geom_pointrange(data=avgTurkeyBAMRE, aes(x= time, y= Mean ,ymin = CI_low, ymax = CI_high, color=zone), size=1, lwd=1) +
   labs(title=stringr::str_wrap("Weekly Turkey Detection Rate Turkey (triggers/week)",75),
        y = "Avg. Turkey Triggers/week",
        x = "Time",
@@ -368,3 +416,84 @@ WHERE
 g83100.sswi_metadata.metadata_name = 'TRAVEL_CORRIDOR_TYPE_CODE'")%>%
   mutate(CAMERA_LOCATION_SEQ_NO=as.character(CAMERA_LOCATION_SEQ_NO))%>%
   rename(camera_location_seq_no = CAMERA_LOCATION_SEQ_NO, trailtype=METADATA_TEXT)
+
+
+camsites2 <- camsites[1:500,]
+
+system.time({lm_output <- 
+              buffers %>% 
+              set_names() %>% 
+              # produce a dataframe after this is all done
+              map_dfr( 
+                ~sample_lsm(
+                  # raster layer
+                  landscape = layer,
+                  # camera locations
+                  y = camsites2,
+                  # get landcover class level metrics
+                  level = "class",
+                  # return NA values for classes not in buffer
+                  # all_classes = TRUE, 
+                  # camera site IDs here
+                  plot_id = camsites2$cam_site_id,
+                  # can do multiple metrics at once
+                  what = 'lsm_c_pland',
+                  # buffer sizes to use
+                  size = ., 
+                  # default is square buffer
+                  shape = "circle", 
+                  # turn warnings on or off
+                  verbose = FALSE 
+                ), 
+                # get buffer size column in the output
+                .id = "buffer_size"
+              )}) #7.26mins
+
+
+system.time({
+  plan(multisession, workers=2)
+  lm_output <- future_lapply(X=buffers, FUN=function(x) {
+    sample_lsm( #\x is shorthand for function (x)
+    # raster layer
+    landscape = layer,
+    # camera locations
+    y = camsites2,
+    # return NA values for classes not in buffer
+    # all_classes = TRUE, 
+    # camera site IDs here
+    plot_id = camsites2$cam_site_id,
+    # can do multiple metrics at once
+    what = 'lsm_c_pland',
+    # buffer sizes to use
+    size = x, 
+    # default is square buffer
+    shape = "circle", 
+    # turn warnings on or off
+    verbose = FALSE 
+      )})
+  plan(sequential)
+  })
+bufferlist
+
+
+# create vector with metrics
+subset_metrics <- landscapemetrics::list_lsm(level = "landscape", 
+                                             type = "diversity metric", 
+                                             simplify = TRUE)
+
+# create window
+window_mat <- matrix(1, nrow = 5,ncol = 5)
+
+# setup future plan for parallel computing
+future::plan(future::multisession)
+
+# calculate each metric in parallel 
+result <- future.apply::future_lapply(X = subset_metrics, FUN = function(i) {
+  
+  # run window_lsm and simplifiy result; 
+  # 1st list level: number of layers, 2nd list level: number of metrics
+  window_lsm(landscape, window = window_mat, what = i)[[1]][[1]]
+  
+}, future.seed = TRUE)
+
+

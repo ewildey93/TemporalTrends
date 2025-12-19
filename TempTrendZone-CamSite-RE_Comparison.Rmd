@@ -20,6 +20,7 @@ library(terra)
 library(readxl)
 library(tidyr)
 library(DBI)
+library(tictoc)
 
 sswids::connect_to_sswidb(db_version = 'PROD')
 
@@ -79,7 +80,7 @@ ForestProp <- function(camsites, buffers, layer){
       ), 
       # get buffer size column in the output
       .id = "buffer_size"
-    )
+    )#%>%list_rbind
   
   lm_output <- left_join(lm_output, WisclandGuide, by= join_by(class == dn.label))
   lm_output$label <- gsub(pattern = "\\W", replacement = "", x = lm_output$label)
@@ -159,6 +160,7 @@ Turkey4 <- left_join(longerdelim, trailtype)%>%group_by(across(c(-trailtype, -ca
             trailtype=paste(unique(trailtype),collapse =","))%>%ungroup()
 Turkey5 <- Turkey4%>%filter(trailtype %in% c("GT", "MT"))
 Turkey5$trailtype <- as.factor(Turkey5$trailtype)
+Turkey5$cam_site_id <- as.factor(Turkey5$cam_site_id)
 ```
 
 ## GAM with Zone-Aggregated Data
@@ -222,8 +224,12 @@ TurkeyBam <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat, 
 
 summary(TurkeyBam, re.test=FALSE)
 
-avgTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
-occTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=occ+nocc*(season-1))
+tic()
+avgTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while 1253
+toc()
+tic()
+occTurkeyBAM <- estimate_means(TurkeyBam, by = c("zone", "season", "occ"), estimate = "average")%>%mutate(time=occ+nocc*(season-1)) #1319-
+toc()
 ```
 
 
@@ -240,8 +246,13 @@ TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat
 
 summary(TurkeyBamRE, re.test=FALSE)
 
-avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average", discrete=TRUE, n.threads=2)%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
-occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ"), estimate="average", discrete=TRUE, n.threads=2)%>%mutate(time=occ+nocc*(season-1))#1410-1506
+tic()
+avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
+toc()
+tic()
+occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ=c(4,8,12,16,20,24,28,32,36,40,44,48,52)"), estimate="average")%>%mutate(time=occ+nocc*(season-1))#1410-1506, 0820-1300
+toc()
+
 ```
 
 ## Zone GAM plot
@@ -431,7 +442,7 @@ TurkeyBamRE <- mgcv::bam(TURKEY_AMT ~ zone + camera_version2 + trailtype + s(lat
 summary(TurkeyBamRE, re.test=FALSE)
 
 avgTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season"), estimate = "average")%>%mutate(time=(nocc/2)+nocc*(season-1))#takes a while
-occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ"))%>%mutate(time=occ+nocc*(season-1))
+occTurkeyBAMRE <- estimate_means(TurkeyBamRE, by = c("zone", "season", "occ=c(4,8,12,16,20,24,28,32,36,40,44,48,52)"))%>%mutate(time=occ+nocc*(season-1))
 ```
 
 ## Zone GAM plot
